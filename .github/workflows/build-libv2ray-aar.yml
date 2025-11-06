@@ -1,18 +1,33 @@
-name: build-libv2ray-aar
+name: Build libv2ray.aar (no-xudp friendly)
 
 on:
   workflow_dispatch:
+    inputs:
+      core_repo:
+        description: 'Git URL AndroidLibXrayLite (или ваш форк)'
+        required: false
+        default: 'https://github.com/2dust/AndroidLibXrayLite.git'
+      core_ref:
+        description: 'Git ref/branch/tag для AndroidLibXrayLite (пусто = дефолтная ветка)'
+        required: false
+        default: ''
+  push:
+    tags:
+      - 'libv2ray-*'
 
 permissions:
   contents: read
 
+env:
+  ANDROID_SDK_ROOT: ${{ github.workspace }}/android-sdk
+  ANDROID_HOME:     ${{ github.workspace }}/android-sdk
+  # Можно зафиксировать NDK при желании
+  ANDROID_NDK_VERSION: '26.3.11579264'
+  GO_VERSION: '1.22.x'
+
 jobs:
   build:
-    runs-on: ubuntu-24.04
-    env:
-      ANDROID_SDK_ROOT: ${{ github.workspace }}/android-sdk
-      ANDROID_HOME: ${{ github.workspace }}/android-sdk
-      ANDROID_NDK_VERSION: 26.3.11579264
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout this repo (workflow)
@@ -22,78 +37,144 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: 17
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23.x'
+          go-version: ${{ env.GO_VERSION }}
 
       - name: Install Android SDK / NDK (cmdline-tools)
+        shell: bash
         run: |
-          set -eux
-          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
-          curl -sSL https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o cmdtools.zip
-          unzip -q cmdtools.zip -d "$ANDROID_SDK_ROOT/cmdline-tools"
-          mv "$ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools" "$ANDROID_SDK_ROOT/cmdline-tools/latest"
-          export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$PATH"
-          yes | sdkmanager --sdk_root="$ANDROID_SDK_ROOT" --licenses || true
-          sdkmanager --sdk_root="$ANDROID_SDK_ROOT" \
-            "platforms;android-34" \
+          set -euxo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends unzip libc6 libstdc++6 ca-certificates
+
+          mkdir -p "${ANDROID_SDK_ROOT}"/cmdline-tools
+          cd "${ANDROID_SDK_ROOT}"/cmdline-tools
+
+          curl -fsSL https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o cmd.zip
+          unzip -q cmd.zip
+          rm -f cmd.zip
+          # разложим как .../cmdline-tools/latest/**
+          mv cmdline-tools latest
+
+          yes | "${ANDROID_SDK_ROOT}"/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null
+
+          "${ANDROID_SDK_ROOT}"/cmdline-tools/latest/bin/sdkmanager \
             "platform-tools" \
+            "platforms;android-34" \
             "build-tools;34.0.0" \
             "ndk;${ANDROID_NDK_VERSION}"
-          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/${ANDROID_NDK_VERSION}" >> $GITHUB_ENV
-          echo "PATH=$ANDROID_SDK_ROOT/platform-tools:$ANDROID_SDK_ROOT/build-tools/34.0.0:$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$PATH" >> $GITHUB_ENV
+
+          echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
+          echo "${ANDROID_SDK_ROOT}/platform-tools" >> $GITHUB_PATH
+          echo "${ANDROID_SDK_ROOT}/build-tools/34.0.0" >> $GITHUB_PATH
 
       - name: Install gomobile/gobind
+        shell: bash
         run: |
-          set -eux
+          set -euxo pipefail
           go install golang.org/x/mobile/cmd/gomobile@latest
           go install golang.org/x/mobile/cmd/gobind@latest
-          "$HOME/go/bin/gomobile" version
-          echo "GOMOBILE=$HOME/go/bin/gomobile" >> $GITHUB_ENV
+          "${HOME}/go/bin/gomobile" version || true
+
+      - name: Install dos2unix (for optional patch script)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y dos2unix
 
       - name: Clone AndroidLibXrayLite
+        shell: bash
         run: |
-          set -eux
-          git clone --depth=1 https://github.com/2dust/AndroidLibXrayLite.git
+          set -euxo pipefail
+          REPO_URL="${{ github.event.inputs.core_repo }}"
+          REF="${{ github.event.inputs.core_ref }}"
+          : "${REPO_URL:=https://github.com/2dust/AndroidLibXrayLite.git}"
+          : "${REF:=}"
 
-      - name: Disable XUDP in sources
+          echo "[clone] ${REPO_URL} ${REF:+@ $REF}"
+          if [[ -z "$REF" ]]; then
+            git clone --depth=1 "${REPO_URL}" AndroidLibXrayLite
+          else
+            git clone --depth=1 --branch "$REF" "${REPO_URL}" AndroidLibXrayLite
+          fi
+
+          test -d AndroidLibXrayLite || { echo "::error::Не удалось клонировать AndroidLibXrayLite"; exit 1; }
+
+      - name: Create & stage patch (disable XUDP) — optional
+        shell: bash
+        continue-on-error: true
         run: |
-          set -eux
-          sudo apt-get update && sudo apt-get install -y dos2unix
-          mkdir -p scripts
-          cat > scripts/disable_xudp.sh <<'SH'
-          #!/usr/bin/env bash
-          set -euo pipefail
-          ROOT="AndroidLibXrayLite"
-          # Глушим любые упоминания xudp (убираем фичу на этапе сборки)
-          grep -RIl --include='*.go' -e 'xudp' "$ROOT" | xargs -r sed -i 's/xudp/xxxp/g'
-          SH
-          dos2unix scripts/disable_xudp.sh
-          bash scripts/disable_xudp.sh
-          echo "[xudp] patch done"
+          set -euxo pipefail
+          # Если вы добавили в свой форк файл scripts/disable_xudp.sh — он применит патч.
+          if [[ -f scripts/disable_xudp.sh ]]; then
+            dos2unix scripts/disable_xudp.sh || true
+            bash scripts/disable_xudp.sh AndroidLibXrayLite
+          else
+            echo "No scripts/disable_xudp.sh — пропускаем этап патча (сборка продолжится)"
+          fi
 
-      - name: Build AAR (arm64 only)
+      - name: gomobile init
         shell: bash
         env:
           ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
         run: |
-          set -euo pipefail
-          # Находим пакет, где объявлен 'package mobile'
-          MOBILE_DIR="$(grep -RIl --include='*.go' -m1 '^package[[:space:]]\+mobile$' AndroidLibXrayLite | xargs -r dirname)"
-          if [[ -z "$MOBILE_DIR" ]]; then
+          set -euxo pipefail
+          "${HOME}/go/bin/gomobile" init
+
+      - name: Build AAR (arm64 only)
+        shell: bash
+        env:
+          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
+        run: |
+          set -euxo pipefail
+
+          echo "==== go env ===="
+          go env
+
+          echo "==== probe repo tree ===="
+          find AndroidLibXrayLite -maxdepth 3 -name go.mod -print || true
+
+          # Находим пакет с 'package mobile', если нет — используем корень (при модульном проекте).
+          MOBILE_DIR="$(grep -RIl --include='*.go' -m1 '^package[[:space:]]\+mobile$' AndroidLibXrayLite | xargs -r dirname || true)"
+          if [[ -z "${MOBILE_DIR}" ]]; then
             if [[ -f AndroidLibXrayLite/go.mod ]]; then
               MOBILE_DIR="AndroidLibXrayLite"
             else
-              echo "::error::Не найден пакет 'mobile' в AndroidLibXrayLite"; exit 1
+              echo "::error::Не найден пакет 'mobile' и нет go.mod в корне AndroidLibXrayLite"; exit 1
             fi
           fi
-          echo "Using package: $MOBILE_DIR"
-          "$GOMOBILE" bind -v -target=android/arm64 -androidapi=24 -o libv2ray.aar "$MOBILE_DIR"
+          echo "Using package: ${MOBILE_DIR}"
+
+          echo "==== go mod download (${MOBILE_DIR}) ===="
+          pushd "${MOBILE_DIR}"
+            go mod download
+          popd
+
+          echo "==== gomobile bind ===="
+          "${HOME}/go/bin/gomobile" bind -v \
+            -target=android/arm64 \
+            -androidapi=24 \
+            -o libv2ray.aar \
+            "${MOBILE_DIR}" 2>&1 | tee build.log
+
+          test -f libv2ray.aar || { echo "::error::gomobile bind не создал libv2ray.aar"; exit 1; }
+
+      - name: Upload build log (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
 
       - name: Upload artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: libv2ray-aar
