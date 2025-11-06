@@ -103,15 +103,43 @@ jobs:
           echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
           gomobile init
 
-      - name: Build AAR (arm64 only)
+            - name: Build AAR (arm64 only)
         shell: bash
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_SDK_ROOT }}
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
         run: |
           set -euo pipefail
-          export ANDROID_HOME="${ANDROID_SDK_ROOT}"
-          export ANDROID_NDK_HOME="${ANDROID_NDK_HOME}"
-          pushd AndroidLibXrayLite/mobile >/dev/null
-          gomobile bind -v -target=android/arm64 -androidapi=24 -o "${GITHUB_WORKSPACE}/libv2ray.aar" .
-          popd >/dev/null
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
+
+          # Печать структуры для дебага (верхний уровень)
+          echo "== top-level of AndroidLibXrayLite =="
+          ls -la AndroidLibXrayLite || true
+
+          # Находим реальный каталог пакета, где объявлен `package mobile`
+          MOBILE_DIR="$(grep -RIl --include='*.go' -m1 '^package[[:space:]]\+mobile$' AndroidLibXrayLite || true)"
+          if [[ -z "${MOBILE_DIR}" ]]; then
+            # fallback: ищем директорию с go.mod и .go файлами — вдруг пакет на уровне модуля
+            if [[ -f AndroidLibXrayLite/go.mod ]]; then
+              MOBILE_DIR="AndroidLibXrayLite"
+            fi
+          else
+            MOBILE_DIR="$(dirname "$MOBILE_DIR")"
+          fi
+
+          if [[ -z "${MOBILE_DIR}" || ! -d "${MOBILE_DIR}" ]]; then
+            echo "::error::Не найден пакет Go с package mobile в AndroidLibXrayLite"
+            exit 1
+          fi
+
+          echo "== выбранный пакет для gomobile bind =="
+          echo "${MOBILE_DIR}"
+          ls -la "${MOBILE_DIR}"
+
+          # Сборка .aar
+          gomobile bind -v -target=android/arm64 -androidapi=24 -o "${GITHUB_WORKSPACE}/libv2ray.aar" "${MOBILE_DIR}"
+
 
       - name: Verify .aar
         shell: bash
