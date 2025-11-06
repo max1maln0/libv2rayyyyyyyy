@@ -8,7 +8,11 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    env:
+      ANDROID_SDK_ROOT: ${{ github.workspace }}/android-sdk
+      ANDROID_HOME: ${{ github.workspace }}/android-sdk
+      ANDROID_NDK_VERSION: 26.3.11579264
 
     steps:
       - name: Checkout this repo (workflow)
@@ -18,135 +22,76 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: '17'
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.22.x"
+          go-version: '1.23.x'
 
       - name: Install Android SDK / NDK (cmdline-tools)
-        uses: android-actions/setup-android@v3
-
-      - name: Install required Android packages
-        shell: bash
         run: |
-          set -euo pipefail
-          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;26.3.11579264" >/dev/null
-          yes | sdkmanager --licenses || true
-          echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/26.3.11579264" >> $GITHUB_ENV
+          set -eux
+          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
+          curl -sSL https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o cmdtools.zip
+          unzip -q cmdtools.zip -d "$ANDROID_SDK_ROOT/cmdline-tools"
+          mv "$ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools" "$ANDROID_SDK_ROOT/cmdline-tools/latest"
+          export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$PATH"
+          yes | sdkmanager --sdk_root="$ANDROID_SDK_ROOT" --licenses || true
+          sdkmanager --sdk_root="$ANDROID_SDK_ROOT" \
+            "platforms;android-34" \
+            "platform-tools" \
+            "build-tools;34.0.0" \
+            "ndk;${ANDROID_NDK_VERSION}"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/${ANDROID_NDK_VERSION}" >> $GITHUB_ENV
+          echo "PATH=$ANDROID_SDK_ROOT/platform-tools:$ANDROID_SDK_ROOT/build-tools/34.0.0:$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$PATH" >> $GITHUB_ENV
 
       - name: Install gomobile/gobind
-        shell: bash
         run: |
-          set -euo pipefail
+          set -eux
           go install golang.org/x/mobile/cmd/gomobile@latest
           go install golang.org/x/mobile/cmd/gobind@latest
-          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
-          gomobile version || true
-
-      - name: Install dos2unix
-        run: sudo apt-get update && sudo apt-get install -y dos2unix
+          "$HOME/go/bin/gomobile" version
+          echo "GOMOBILE=$HOME/go/bin/gomobile" >> $GITHUB_ENV
 
       - name: Clone AndroidLibXrayLite
-        shell: bash
         run: |
-          set -euo pipefail
+          set -eux
           git clone --depth=1 https://github.com/2dust/AndroidLibXrayLite.git
 
-      - name: Create & apply XUDP patch
-        shell: bash
+      - name: Disable XUDP in sources
         run: |
-          set -euo pipefail
+          set -eux
+          sudo apt-get update && sudo apt-get install -y dos2unix
           mkdir -p scripts
-          cat > scripts/disable_xudp.sh <<'BASH'
+          cat > scripts/disable_xudp.sh <<'SH'
           #!/usr/bin/env bash
           set -euo pipefail
-          CORE_DIR="${1:-${GITHUB_WORKSPACE:-.}/AndroidLibXrayLite}"
-          echo "[xudp] core dir: ${CORE_DIR}"
-          if [[ ! -d "$CORE_DIR" ]]; then
-            echo "::warning::Core dir not found: ${CORE_DIR}. Skip patch."
-            exit 0
-          fi
-          mapfile -t CANDIDATES < <(grep -RIl --include='*.go' -e 'xray\.xudp\.basekey' -e 'xray\.xudp' "${CORE_DIR}" || true)
-          if [[ "${#CANDIDATES[@]}" -eq 0 ]]; then
-            echo "::warning::No xudp usages found."
-            exit 0
-          fi
-          patch_file () {
-            local f="$1"
-            cp -f "$f" "$f.bak"
-            sed -i -e 's/os\.Getenv\s*(\s*"xray\.xudp"\s*)/"off"/g' -e 's/Getenv\s*(\s*"xray\.xudp"\s*)/"off"/g' "$f"
-            sed -i -e 's/os\.Getenv\s*(\s*"xray\.xudp\.basekey"\s*)/""/g' -e 's/Getenv\s*(\s*"xray\.xudp\.basekey"\s*)/""/g' "$f"
-            sed -i -e 's/panic\s*(.*xray\.xudp\.basekey.*)/log.Print("XUDP disabled (panic removed)"); return/g' "$f"
-            sed -i -e 's/len\s*(\s*[^)]\+)\s*!=\s*32/false/g' "$f"
-          }
-          for f in "${CANDIDATES[@]}"; do
-            echo "[xudp] patching: $f"
-            patch_file "$f"
-          done
+          ROOT="AndroidLibXrayLite"
+          # Глушим любые упоминания xudp (убираем фичу на этапе сборки)
+          grep -RIl --include='*.go' -e 'xudp' "$ROOT" | xargs -r sed -i 's/xudp/xxxp/g'
+          SH
+          dos2unix scripts/disable_xudp.sh
+          bash scripts/disable_xudp.sh
           echo "[xudp] patch done"
-          BASH
-          chmod +x scripts/disable_xudp.sh
-          dos2unix scripts/disable_xudp.sh || true
-          ./scripts/disable_xudp.sh "${GITHUB_WORKSPACE}/AndroidLibXrayLite"
 
-      # >>> ВАЖНО: здесь БЕЗ флага -ndk <<<
-      - name: gomobile init
+      - name: Build AAR (arm64 only)
         shell: bash
         env:
-          ANDROID_HOME: ${{ env.ANDROID_SDK_ROOT }}
           ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
         run: |
           set -euo pipefail
-          echo "ANDROID_HOME=$ANDROID_HOME"
-          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
-          gomobile init
-
-            - name: Build AAR (arm64 only)
-        shell: bash
-        env:
-          ANDROID_HOME: ${{ env.ANDROID_SDK_ROOT }}
-          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
-        run: |
-          set -euo pipefail
-          echo "ANDROID_HOME=$ANDROID_HOME"
-          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
-
-          # Печать структуры для дебага (верхний уровень)
-          echo "== top-level of AndroidLibXrayLite =="
-          ls -la AndroidLibXrayLite || true
-
-          # Находим реальный каталог пакета, где объявлен `package mobile`
-          MOBILE_DIR="$(grep -RIl --include='*.go' -m1 '^package[[:space:]]\+mobile$' AndroidLibXrayLite || true)"
-          if [[ -z "${MOBILE_DIR}" ]]; then
-            # fallback: ищем директорию с go.mod и .go файлами — вдруг пакет на уровне модуля
+          # Находим пакет, где объявлен 'package mobile'
+          MOBILE_DIR="$(grep -RIl --include='*.go' -m1 '^package[[:space:]]\+mobile$' AndroidLibXrayLite | xargs -r dirname)"
+          if [[ -z "$MOBILE_DIR" ]]; then
             if [[ -f AndroidLibXrayLite/go.mod ]]; then
               MOBILE_DIR="AndroidLibXrayLite"
+            else
+              echo "::error::Не найден пакет 'mobile' в AndroidLibXrayLite"; exit 1
             fi
-          else
-            MOBILE_DIR="$(dirname "$MOBILE_DIR")"
           fi
-
-          if [[ -z "${MOBILE_DIR}" || ! -d "${MOBILE_DIR}" ]]; then
-            echo "::error::Не найден пакет Go с package mobile в AndroidLibXrayLite"
-            exit 1
-          fi
-
-          echo "== выбранный пакет для gomobile bind =="
-          echo "${MOBILE_DIR}"
-          ls -la "${MOBILE_DIR}"
-
-          # Сборка .aar
-          gomobile bind -v -target=android/arm64 -androidapi=24 -o "${GITHUB_WORKSPACE}/libv2ray.aar" "${MOBILE_DIR}"
-
-
-      - name: Verify .aar
-        shell: bash
-        run: |
-          set -euo pipefail
-          ls -l libv2ray.aar
-          unzip -l libv2ray.aar | sed -n '1,120p'
+          echo "Using package: $MOBILE_DIR"
+          "$GOMOBILE" bind -v -target=android/arm64 -androidapi=24 -o libv2ray.aar "$MOBILE_DIR"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
