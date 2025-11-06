@@ -13,7 +13,8 @@ if [[ -z "${LXLITE_REPO:-}" || -z "${LXLITE_REF:-}" ]]; then
 fi
 
 # Клонируем репозиторий
-git clone --depth=1 --branch "$LXLITE_REF" "$LXLITE_REPO" AndroidLibXrayLite
+git clone --depth=1 "$LXLITE_REPO" AndroidLibXrayLite
+
 cd AndroidLibXrayLite
 
 MOBILE_DIR="mobile"
@@ -58,3 +59,4 @@ grep -RIl --include='*.go' -e 'BaseKey must be 32 bytes' . \
     done
 
 echo "[done] AndroidLibXrayLite patched successfully."
+
