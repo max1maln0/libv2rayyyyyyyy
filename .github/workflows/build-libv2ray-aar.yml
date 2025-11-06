@@ -59,9 +59,13 @@ jobs:
           go install golang.org/x/mobile/cmd/gomobile@latest
           go install golang.org/x/mobile/cmd/gobind@latest
 
-      - name: Clone AndroidLibXrayLite and patch
+      - name: Fix line endings and run patch script
         run: |
+          sudo apt-get update && sudo apt-get install -y dos2unix
+          dos2unix scripts/clone_and_patch.sh
           bash scripts/clone_and_patch.sh
+        shell: bash
+
 
       - name: gomobile init
         working-directory: AndroidLibXrayLite/mobile
