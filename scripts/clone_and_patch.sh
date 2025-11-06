@@ -1,119 +1,79 @@
 #!/usr/bin/env bash
-# Clones AndroidLibXrayLite and patches out XUDP on Android.
-# Produces an output "pkg_dir" with the path to the go module to build.
+# shellcheck disable=SC2086
 
 set -euo pipefail
 
-echo "[clone] AndroidLibXrayLite: ${LXLITE_REPO:-https://github.com/2dust/AndroidLibXrayLite.git} @ ${LXLITE_REF:-<default>}"
-
 REPO_URL="${LXLITE_REPO:-https://github.com/2dust/AndroidLibXrayLite.git}"
-REPO_REF="${LXLITE_REF:-}"
+REPO_REF="${LXLITE_REF:-main}"
 
-# 1) Clone (default branch if ref is empty)
-if [[ -n "$REPO_REF" ]]; then
-  git clone --depth=1 --branch "$REPO_REF" "$REPO_URL" AndroidLibXrayLite
+echo "[clone] AndroidLibXrayLite: ${REPO_URL} @ ${REPO_REF}"
+
+# Клонируем лёгко (depth=1) c правильной веткой (main)
+if [[ -n "${REPO_REF}" ]]; then
+  git clone --depth=1 --branch "${REPO_REF}" "${REPO_URL}" AndroidLibXrayLite
 else
-  git clone --depth=1 "$REPO_URL" AndroidLibXrayLite
+  git clone --depth=1 "${REPO_URL}" AndroidLibXrayLite
 fi
+
 cd AndroidLibXrayLite
 
-# 2) Detect go module root (prefer top-level go.mod; if several, pick the one that contains .go files)
-echo "[detect] looking for go.mod…"
-mapfile -t MODS < <(git ls-files | grep -E '(^|/)(go\.mod)$' || true)
-
-if [[ ${#MODS[@]} -eq 0 ]]; then
-  echo "::error::go.mod not found in repo; cannot proceed"
+# На практике go-пакет лежит в корне репозитория (модуль mobile).
+# Проверим наличие go.mod рядом.
+if [[ ! -f "go.mod" ]]; then
+  echo "::error::go.mod not found at repository root"
   exit 1
 fi
 
-# Choose module dir that contains the most .go files
-BEST_MOD=""
-BEST_COUNT=-1
-for m in "${MODS[@]}"; do
-  dir="$(dirname "$m")"
-  [[ "$dir" == "." ]] && dir="."
-  count=$(find "$dir" -type f -name '*.go' ! -name '*_test.go' | wc -l | tr -d ' ')
-  [[ -z "$count" ]] && count=0
-  if [[ $count -gt $BEST_COUNT ]]; then
-    BEST_COUNT=$count
-    BEST_MOD="$dir"
-  fi
-done
+# --- ПАТЧ, чтобы xudp/basekey никем не устанавливался и не читался ---
 
-if [[ -z "$BEST_MOD" || "$BEST_COUNT" -le 0 ]]; then
-  echo "::error::No .go files found next to go.mod; cannot proceed"
-  exit 1
-fi
+# 1) Глобально выключаем XUDP на Android и гасим любые Setenv к basekey
+#    (у 2dust периодически проскальзывает что-то вроде установки basekey из cache-dir).
+#    Патчим все встреченные места.
+git grep -n -E 'xray\.xudp|XRAY_XUDP_BASEKEY|xudp\.basekey' || true
 
-echo "[detect] go module dir: $BEST_MOD  (.go files: $BEST_COUNT)"
-cd "$BEST_MOD"
+# Мягко выпилим любые попытки установки basekey/env (оставим комментариями).
+# sed работает только если такие строки встретятся — иначе просто молча пройдём.
+# Патчим *.go по всему дереву.
+find . -type f -name '*.go' -print0 | xargs -0 sed -i \
+  -e 's/\(os\.Setenv\s*(\s*"xray\.xudp\.basekey"[^)]*)\)/\/\/ patched: \1/g' \
+  -e 's/\(os\.Setenv\s*(\s*"XRAY_XUDP_BASEKEY"[^)]*)\)/\/\/ patched: \1/g' \
+  -e 's/\(os\.Setenv\s*(\s*"XRAY\.XUDP\.BASEKEY"[^)]*)\)/\/\/ patched: \1/g' \
+  -e 's/\(os\.Setenv\s*(\s*"xray\.xudp"\s*,\s*"on"\s*[^)]*)\)/\/\/ patched: \1/g'
 
-# 3) Detect dominant package name (exclude tests, pick most frequent non "main")
-echo "[detect] dominant package name…"
-PKG=$(grep -Rho --include='*.go' '^package[[:space:]]\+[a-zA-Z0-9_]\+' . \
-      | awk '{print $2}' \
-      | grep -v '^main$' \
-      | sort | uniq -c | sort -nr | awk 'NR==1{print $2}')
+# 2) Добавим guard-файл, который в рантайме жёстко выключает XUDP.
+#    Файл кладём в корень модуля, пакет выбираем "mobile" (у 2dust основной pkg).
+cat > xudp_guard_android.go <<'EOF'
+package mobile
 
-if [[ -z "${PKG:-}" ]]; then
-  # fallback: if only main exists – используем main
-  PKG=$(grep -Rho --include='*.go' '^package[[:space:]]\+[a-zA-Z0-9_]\+' . \
-        | awk '{print $2}' \
-        | sort | uniq -c | sort -nr | awk 'NR==1{print $2}')
-fi
+import (
+	"os"
+)
 
-if [[ -z "${PKG:-}" ]]; then
-  echo "::error::Cannot determine package name to place guard file"
-  exit 1
-fi
-echo "[detect] package: $PKG"
-
-# 4) Add android-only guard file to disable XUDP at build time
-echo "[patch] adding xudp_guard_android.go (//go:build android)"
-cat > xudp_guard_android.go <<EOF
-//go:build android
-// +build android
-
-package ${PKG}
-
-// This file disables XUDP usage on Android builds entirely.
-// We do not rely on env vars to avoid early init panics in Go bindings.
-
+// android-only: выключаем XUDP всегда и подставляем безопасный ключ-строку,
+// чтобы любые ранние проверки в go-биндингах не падали.
 func init() {
-    _ = "XUDP disabled at build-time (patched)"
+	_ = os.Setenv("xray.xudp", "off")
+	_ = os.Setenv("xray.xudp.show", "")
+	// 32 байта в base64url (43 символа) — валидная, но не используемая строка.
+	_ = os.Setenv("xray.xudp.basekey", "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8")
+	_ = os.Setenv("XRAY_XUDP_BASEKEY", "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8")
+	_ = os.Setenv("XRAY.XUDP.BASEKEY", "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8")
 }
 EOF
 
-# 5) Strip any env writes/reads to xudp.basekey variants and soften panics
-echo "[patch] removing env basekey references and panics"
-# Remove lines that touch basekey envs
-grep -RIl --include='*.go' -e 'xudp\.basekey' -e 'XRAY_XUDP_BASEKEY' -e 'XRAY\.XUDP\.BASEKEY' . | while read -r f; do
-  echo "  - clean $f"
-  sed -i '/xudp\.basekey/d' "$f" || true
-  sed -i '/XRAY_XUDP_BASEKEY/d' "$f" || true
-  sed -i '/XRAY\.XUDP\.BASEKEY/d' "$f" || true
-done
-
-# Replace explicit BaseKey length panics with safe returns/no-ops
-grep -RIl --include='*.go' -e 'BaseKey must be 32 bytes' . | while read -r f; do
-  echo "  - soften panic in $f"
-  sed -i 's/panic(.*BaseKey.*32 bytes.*)/return/g' "$f" || true
-done
-
-# Optional: make any DecodeString+len(raw)!=32 checks non-fatal
-grep -RIl --include='*.go' -e 'DecodeString' -e 'basekey' -e 'xudp' . | while read -r f; do
-  sed -i 's/if[[:space:]]*err[[:space:]]*!=[[:space:]]*nil[[:space:]]*||[[:space:]]*len(raw)[[:space:]]*!=[[:space:]]*32[[:space:]]*{[^}]*}/if err != nil || len(raw) != 32 { return }/g' "$f" || true
-done
-
-echo "[tree] guard file created at: $(pwd)/xudp_guard_android.go"
-
-# 6) Export path for next workflow steps
-OUT_DIR="$(pwd)"
-if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
-  {
-    echo "pkg_dir=$OUT_DIR"
-    echo "repo_root=$(realpath ..)"
-  } >> "$GITHUB_OUTPUT"
+# На случай, если у mobile другой package-нейм, попробуем автоматически поправить.
+PKG_NAME=$(go list -f '{{.Name}}' 2>/dev/null || echo "mobile")
+if [[ "${PKG_NAME}" != "mobile" ]]; then
+  sed -i "1s/^package .*/package ${PKG_NAME}/" xudp_guard_android.go
 fi
 
-echo "[done] patches applied; pkg_dir=$OUT_DIR"
+# Выведем что получилось (для отладки в логах CI)
+echo "---- patched files ----"
+git status --porcelain
+git diff --name-only
+
+# Вернёмся в корень и сообщим runner-у, где лежит пакет для bind
+cd ..
+echo "pkg_dir=$(pwd)/AndroidLibXrayLite" >> "$GITHUB_OUTPUT"
+
+echo "[ok] clone_and_patch completed"
