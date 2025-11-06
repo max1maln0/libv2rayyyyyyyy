@@ -11,6 +11,111 @@ on:
 
 permissions:
   contents: read
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+    paths:
+      - ".github/workflows/build.yml"
+      - "scripts/**"
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  # Репозиторий 2dust с AndroidLibXrayLite
+  LXLITE_REPO: https://github.com/2dust/AndroidLibXrayLite.git
+  # Ветка у 2dust — main (не master)
+  LXLITE_REF: main
+
+  # Версии инструментов
+  JAVA_VERSION: "17"
+  GO_VERSION: "1.24.x"
+  ANDROID_API: "34"
+  NDK_VERSION: "26.3.11579264"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout template
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+
+      - name: Install Android SDK cmdline-tools
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK and build-tools
+        shell: bash
+        run: |
+          sdkmanager --sdk_root="$ANDROID_SDK_ROOT" \
+            "platforms;android-${ANDROID_API}" \
+            "platform-tools" \
+            "build-tools;34.0.0" \
+            "ndk;${NDK_VERSION}"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/${NDK_VERSION}" >> $GITHUB_ENV
+          echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/${NDK_VERSION}" >> $GITHUB_ENV
+          echo "NDK_HOME=$ANDROID_SDK_ROOT/ndk/${NDK_VERSION}" >> $GITHUB_ENV
+
+      - name: Install gomobile/gobind
+        shell: bash
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gobind@latest
+          echo "$HOME/go/bin" >> $GITHUB_PATH
+
+      - name: Fix line endings and run patch script
+        id: patch
+        shell: bash
+        env:
+          LXLITE_REPO: ${{ env.LXLITE_REPO }}
+          LXLITE_REF:  ${{ env.LXLITE_REF }}
+        run: |
+          sudo apt-get update && sudo apt-get install -y dos2unix
+          dos2unix scripts/clone_and_patch.sh
+          bash scripts/clone_and_patch.sh
+
+      - name: gomobile init
+        shell: bash
+        run: gomobile init
+
+      - name: Build AAR (arm64 only)
+        shell: bash
+        run: |
+          cd "${{ steps.patch.outputs.pkg_dir }}"
+          gomobile bind \
+            -target=android/arm64 \
+            -androidapi ${{ env.ANDROID_API }} \
+            -o "$GITHUB_WORKSPACE/libv2ray.aar" \
+            .
+          ls -lh "$GITHUB_WORKSPACE/libv2ray.aar"
+
+      - name: Verify .aar content
+        shell: bash
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          unzip -l libv2ray.aar | sed -n '1,200p'
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libv2ray-aar
+          path: libv2ray.aar
 
 env:
   # Репозиторий и ветка 2dust c AndroidLibXrayLite
