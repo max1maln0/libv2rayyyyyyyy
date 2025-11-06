@@ -21,7 +21,6 @@ permissions:
 env:
   ANDROID_SDK_ROOT: ${{ github.workspace }}/android-sdk
   ANDROID_HOME:     ${{ github.workspace }}/android-sdk
-  # Можно зафиксировать NDK при желании
   ANDROID_NDK_VERSION: '26.3.11579264'
   GO_VERSION: '1.22.x'
 
@@ -51,18 +50,18 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends unzip libc6 libstdc++6 ca-certificates
 
-          mkdir -p "${ANDROID_SDK_ROOT}"/cmdline-tools
-          cd "${ANDROID_SDK_ROOT}"/cmdline-tools
+          mkdir -p "${ANDROID_SDK_ROOT}/cmdline-tools"
+          cd "${ANDROID_SDK_ROOT}/cmdline-tools"
 
           curl -fsSL https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o cmd.zip
           unzip -q cmd.zip
           rm -f cmd.zip
-          # разложим как .../cmdline-tools/latest/**
           mv cmdline-tools latest
 
-          yes | "${ANDROID_SDK_ROOT}"/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null
+          # ✅ Фикс Broken pipe — просто игнорируем ошибку
+          yes | "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" --licenses || true
 
-          "${ANDROID_SDK_ROOT}"/cmdline-tools/latest/bin/sdkmanager \
+          "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" \
             "platform-tools" \
             "platforms;android-34" \
             "build-tools;34.0.0" \
@@ -103,19 +102,16 @@ jobs:
             git clone --depth=1 --branch "$REF" "${REPO_URL}" AndroidLibXrayLite
           fi
 
-          test -d AndroidLibXrayLite || { echo "::error::Не удалось клонировать AndroidLibXrayLite"; exit 1; }
-
       - name: Create & stage patch (disable XUDP) — optional
         shell: bash
         continue-on-error: true
         run: |
           set -euxo pipefail
-          # Если вы добавили в свой форк файл scripts/disable_xudp.sh — он применит патч.
           if [[ -f scripts/disable_xudp.sh ]]; then
             dos2unix scripts/disable_xudp.sh || true
             bash scripts/disable_xudp.sh AndroidLibXrayLite
           else
-            echo "No scripts/disable_xudp.sh — пропускаем этап патча (сборка продолжится)"
+            echo "No disable_xudp.sh — skip patch"
           fi
 
       - name: gomobile init
@@ -133,14 +129,9 @@ jobs:
           ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
         run: |
           set -euxo pipefail
-
           echo "==== go env ===="
           go env
 
-          echo "==== probe repo tree ===="
-          find AndroidLibXrayLite -maxdepth 3 -name go.mod -print || true
-
-          # Находим пакет с 'package mobile', если нет — используем корень (при модульном проекте).
           MOBILE_DIR="$(grep -RIl --include='*.go' -m1 '^package[[:space:]]\+mobile$' AndroidLibXrayLite | xargs -r dirname || true)"
           if [[ -z "${MOBILE_DIR}" ]]; then
             if [[ -f AndroidLibXrayLite/go.mod ]]; then
@@ -151,12 +142,10 @@ jobs:
           fi
           echo "Using package: ${MOBILE_DIR}"
 
-          echo "==== go mod download (${MOBILE_DIR}) ===="
           pushd "${MOBILE_DIR}"
             go mod download
           popd
 
-          echo "==== gomobile bind ===="
           "${HOME}/go/bin/gomobile" bind -v \
             -target=android/arm64 \
             -androidapi=24 \
