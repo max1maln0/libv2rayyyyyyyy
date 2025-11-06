@@ -1,0 +1,92 @@
+name: Build libv2ray.aar (Android, XUDP disabled)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - '**.yml'
+      - 'scripts/**'
+      - 'patches/**'
+      - 'README.md'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    env:
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      NDK_VERSION: 26.3.11579264
+      ANDROID_API: 24
+      GO_VERSION: '1.22.5'
+      # Ветка/тег апстрима (можно поменять на нужный)
+      LXLITE_REPO: https://github.com/2dust/AndroidLibXrayLite.git
+      LXLITE_REF: master
+
+    steps:
+      - name: Checkout template
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install Android SDK cmdline-tools
+        run: |
+          sudo mkdir -p $ANDROID_SDK_ROOT
+          sudo chown -R $USER:$USER $ANDROID_SDK_ROOT
+          sudo apt-get update
+          sudo apt-get install -y zlib1g-dev unzip curl git
+
+          SDK_URL="https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
+          curl -L "$SDK_URL" -o cmdtools.zip
+          mkdir -p $ANDROID_SDK_ROOT/cmdline-tools
+          unzip -q cmdtools.zip -d $ANDROID_SDK_ROOT/cmdline-tools
+          mv $ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools $ANDROID_SDK_ROOT/cmdline-tools/latest
+          yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --licenses
+
+      - name: Install NDK and build-tools
+        run: |
+          yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager "ndk;${NDK_VERSION}" "platforms;android-${ANDROID_API}" "build-tools;34.0.0"
+          echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}" >> $GITHUB_ENV
+          echo "PATH=${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}:$PATH" >> $GITHUB_ENV
+
+      - name: Install gomobile/gobind
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gobind@latest
+
+      - name: Clone AndroidLibXrayLite and patch
+        run: |
+          bash scripts/clone_and_patch.sh
+
+      - name: gomobile init
+        working-directory: AndroidLibXrayLite/mobile
+        run: |
+          gomobile init -ndk $ANDROID_NDK_HOME
+
+      - name: Build AAR (arm64 only)
+        working-directory: AndroidLibXrayLite/mobile
+        run: |
+          mkdir -p ../../dist
+          # ВАЖНО: если проект использует go.work/go.mod в другом месте, поправь путь "."
+          gomobile bind -v \
+            -target=android/arm64 \
+            -androidapi=${ANDROID_API} \
+            -o ../../dist/libv2ray.aar \
+            .
+          ls -la ../../dist
+
+      - name: Verify .aar content
+        run: |
+          bash scripts/verify_and_print.sh dist/libv2ray.aar
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libv2ray-android-arm64-no-xudp
+          path: dist/libv2ray.aar
+          if-no-files-found: error
