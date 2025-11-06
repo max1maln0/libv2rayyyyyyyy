@@ -1,5 +1,7 @@
+
 #!/usr/bin/env bash
-set -euo pipefail
+set -euxo pipefail
+
 
 echo "[clone] AndroidLibXrayLite: $LXLITE_REPO @ $LXLITE_REF"
 git clone --depth=1 --branch "$LXLITE_REF" "$LXLITE_REPO" AndroidLibXrayLite
@@ -74,3 +76,4 @@ echo "[patch] итоговое дерево:"
 find . -maxdepth 2 -type f -name '*.go' -print
 
 echo "[done] патчи применены."
+
