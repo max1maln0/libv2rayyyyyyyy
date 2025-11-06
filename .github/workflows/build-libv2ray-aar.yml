@@ -33,7 +33,6 @@ jobs:
         run: |
           set -euo pipefail
           sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;26.3.11579264" >/dev/null
-          # иногда sdkmanager завершает раньше 'yes', поэтому не валим билд
           yes | sdkmanager --licenses || true
           echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/26.3.11579264" >> $GITHUB_ENV
 
@@ -53,7 +52,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Берём дефолтную ветку (без принудительного master)
           git clone --depth=1 https://github.com/2dust/AndroidLibXrayLite.git
 
       - name: Create & apply XUDP patch
@@ -64,53 +62,46 @@ jobs:
           cat > scripts/disable_xudp.sh <<'BASH'
           #!/usr/bin/env bash
           set -euo pipefail
-
           CORE_DIR="${1:-${GITHUB_WORKSPACE:-.}/AndroidLibXrayLite}"
           echo "[xudp] core dir: ${CORE_DIR}"
-
           if [[ ! -d "$CORE_DIR" ]]; then
             echo "::warning::Core dir not found: ${CORE_DIR}. Skip patch."
             exit 0
           fi
-
           mapfile -t CANDIDATES < <(grep -RIl --include='*.go' -e 'xray\.xudp\.basekey' -e 'xray\.xudp' "${CORE_DIR}" || true)
           if [[ "${#CANDIDATES[@]}" -eq 0 ]]; then
             echo "::warning::No xudp usages found."
             exit 0
           fi
-
           patch_file () {
             local f="$1"
             cp -f "$f" "$f.bak"
-            # XUDP всегда off
             sed -i -e 's/os\.Getenv\s*(\s*"xray\.xudp"\s*)/"off"/g' -e 's/Getenv\s*(\s*"xray\.xudp"\s*)/"off"/g' "$f"
-            # basekey всегда пустой
             sed -i -e 's/os\.Getenv\s*(\s*"xray\.xudp\.basekey"\s*)/""/g' -e 's/Getenv\s*(\s*"xray\.xudp\.basekey"\s*)/""/g' "$f"
-            # убираем panics по basekey
             sed -i -e 's/panic\s*(.*xray\.xudp\.basekey.*)/log.Print("XUDP disabled (panic removed)"); return/g' "$f"
-            # проверки длины ключа делаем недостижимыми
             sed -i -e 's/len\s*(\s*[^)]\+)\s*!=\s*32/false/g' "$f"
           }
-
           for f in "${CANDIDATES[@]}"; do
             echo "[xudp] patching: $f"
             patch_file "$f"
           done
-
           echo "[xudp] patch done"
           BASH
-
           chmod +x scripts/disable_xudp.sh
           dos2unix scripts/disable_xudp.sh || true
           ./scripts/disable_xudp.sh "${GITHUB_WORKSPACE}/AndroidLibXrayLite"
 
+      # >>> ВАЖНО: здесь БЕЗ флага -ndk <<<
       - name: gomobile init
         shell: bash
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_SDK_ROOT }}
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
         run: |
           set -euo pipefail
-          export ANDROID_HOME="${ANDROID_SDK_ROOT}"
-          export ANDROID_NDK_HOME="${ANDROID_NDK_HOME}"
-          gomobile init -ndk "${ANDROID_NDK_HOME}"
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
+          gomobile init
 
       - name: Build AAR (arm64 only)
         shell: bash
@@ -118,9 +109,7 @@ jobs:
           set -euo pipefail
           export ANDROID_HOME="${ANDROID_SDK_ROOT}"
           export ANDROID_NDK_HOME="${ANDROID_NDK_HOME}"
-          # В AndroidLibXrayLite java-пакет лежит в каталоге 'mobile'
           pushd AndroidLibXrayLite/mobile >/dev/null
-          # Ставим минимальный api у выходного .aar
           gomobile bind -v -target=android/arm64 -androidapi=24 -o "${GITHUB_WORKSPACE}/libv2ray.aar" .
           popd >/dev/null
 
@@ -129,7 +118,7 @@ jobs:
         run: |
           set -euo pipefail
           ls -l libv2ray.aar
-          unzip -l libv2ray.aar | sed -n '1,80p'
+          unzip -l libv2ray.aar | sed -n '1,120p'
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
