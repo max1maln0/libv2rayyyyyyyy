@@ -1,96 +1,113 @@
-name: Build libv2ray.aar (Android, XUDP disabled)
+name: build
 
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    branches: [ main, master ]
     paths:
-      - '**.yml'
-      - 'scripts/**'
-      - 'patches/**'
-      - 'README.md'
+      - ".github/workflows/build.yml"
+      - "scripts/**"
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  # Репозиторий и ветка 2dust c AndroidLibXrayLite
+  LXLITE_REPO: https://github.com/2dust/AndroidLibXrayLite.git
+  LXLITE_REF: main
+
+  # Версии инструментов
+  JAVA_VERSION: "17"
+  GO_VERSION: "1.24.x"          # gomobile сейчас тянет go1.24.x (см. твои логи)
+  ANDROID_API: "34"
+  NDK_VERSION: "26.3.11579264"  # стабильная; можно поменять при желании
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
-    env:
-      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
-      ANDROID_HOME: /usr/local/lib/android/sdk
-      NDK_VERSION: 26.3.11579264
-      ANDROID_API: 24
-      GO_VERSION: '1.22.5'
-      # Ветка/тег апстрима (можно поменять на нужный)
-      LXLITE_REPO: https://github.com/2dust/AndroidLibXrayLite.git
-      LXLITE_REF: master
-
     steps:
       - name: Checkout template
         uses: actions/checkout@v4
 
+      # JDK для gomobile/gobind
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      # Go для gomobile
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
-          cache: true
+          check-latest: true
 
+      # Android SDK + cmdline-tools
       - name: Install Android SDK cmdline-tools
-        run: |
-          sudo mkdir -p $ANDROID_SDK_ROOT
-          sudo chown -R $USER:$USER $ANDROID_SDK_ROOT
-          sudo apt-get update
-          sudo apt-get install -y zlib1g-dev unzip curl git
+        uses: android-actions/setup-android@v3
 
-          SDK_URL="https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
-          curl -L "$SDK_URL" -o cmdtools.zip
-          mkdir -p $ANDROID_SDK_ROOT/cmdline-tools
-          unzip -q cmdtools.zip -d $ANDROID_SDK_ROOT/cmdline-tools
-          mv $ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools $ANDROID_SDK_ROOT/cmdline-tools/latest
-          yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --licenses
-
+      # Устанавливаем нужные компоненты SDK/NDK
       - name: Install NDK and build-tools
+        shell: bash
         run: |
-          yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager "ndk;${NDK_VERSION}" "platforms;android-${ANDROID_API}" "build-tools;34.0.0"
-          echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}" >> $GITHUB_ENV
-          echo "PATH=${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}:$PATH" >> $GITHUB_ENV
+          sdkmanager --sdk_root="$ANDROID_SDK_ROOT" \
+            "platforms;android-${ANDROID_API}" \
+            "platform-tools" \
+            "build-tools;34.0.0" \
+            "ndk;${NDK_VERSION}"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/${NDK_VERSION}" >> $GITHUB_ENV
+          echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/${NDK_VERSION}" >> $GITHUB_ENV
+          echo "NDK_HOME=$ANDROID_SDK_ROOT/ndk/${NDK_VERSION}" >> $GITHUB_ENV
 
+      # gomobile/gobind
       - name: Install gomobile/gobind
+        shell: bash
         run: |
           go install golang.org/x/mobile/cmd/gomobile@latest
           go install golang.org/x/mobile/cmd/gobind@latest
+          echo "$HOME/go/bin" >> $GITHUB_PATH
 
+      # Конвертируем окончания строк и запускаем патчер
       - name: Fix line endings and run patch script
+        id: patch
+        shell: bash
         run: |
           sudo apt-get update && sudo apt-get install -y dos2unix
           dos2unix scripts/clone_and_patch.sh
           bash scripts/clone_and_patch.sh
-        shell: bash
+        # Скрипт пишет в $GITHUB_OUTPUT переменную pkg_dir
 
-
+      # Инициализация gomobile (создаёт android-стабсы и кеши)
       - name: gomobile init
-        working-directory: AndroidLibXrayLite/mobile
-        run: |
-          gomobile init -ndk $ANDROID_NDK_HOME
+        shell: bash
+        run: gomobile init
 
+      # Сборка AAR (arm64)
       - name: Build AAR (arm64 only)
-        working-directory: AndroidLibXrayLite/mobile
+        shell: bash
         run: |
-          mkdir -p ../../dist
-          # ВАЖНО: если проект использует go.work/go.mod в другом месте, поправь путь "."
-          gomobile bind -v \
+          cd "${{ steps.patch.outputs.pkg_dir }}"
+          echo "Build dir: $(pwd)"
+          gomobile bind \
             -target=android/arm64 \
-            -androidapi=${ANDROID_API} \
-            -o ../../dist/libv2ray.aar \
+            -androidapi ${{ env.ANDROID_API }} \
+            -o "$GITHUB_WORKSPACE/libv2ray.aar" \
             .
-          ls -la ../../dist
+          ls -lh "$GITHUB_WORKSPACE/libv2ray.aar"
 
+      # Быстрая проверка содержимого AAR
       - name: Verify .aar content
+        shell: bash
         run: |
-          bash scripts/verify_and_print.sh dist/libv2ray.aar
+          cd "$GITHUB_WORKSPACE"
+          unzip -l libv2ray.aar | sed -n '1,200p'
 
+      # Публикуем артефакт
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: libv2ray-android-arm64-no-xudp
-          path: dist/libv2ray.aar
-          if-no-files-found: error
+          name: libv2ray-aar
+          path: libv2ray.aar
