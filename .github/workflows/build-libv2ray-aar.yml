@@ -8,7 +8,7 @@ on:
         required: false
         default: 'https://github.com/2dust/AndroidLibXrayLite.git'
       core_ref:
-        description: 'Git ref/branch/tag для AndroidLibXrayLite (пусто = дефолтная ветка)'
+        description: 'Git ref/branch/tag (пусто = дефолтная ветка)'
         required: false
         default: ''
   push:
@@ -52,13 +52,12 @@ jobs:
 
           mkdir -p "${ANDROID_SDK_ROOT}/cmdline-tools"
           cd "${ANDROID_SDK_ROOT}/cmdline-tools"
-
           curl -fsSL https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o cmd.zip
           unzip -q cmd.zip
           rm -f cmd.zip
           mv cmdline-tools latest
 
-          # ✅ Фикс Broken pipe — просто игнорируем ошибку
+          # Лицензии: возможен Broken pipe — игнорируем и идём дальше
           yes | "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" --licenses || true
 
           "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" \
@@ -75,11 +74,14 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+          go env -w GOPROXY=https://proxy.golang.org,direct
           go install golang.org/x/mobile/cmd/gomobile@latest
           go install golang.org/x/mobile/cmd/gobind@latest
+          # Прогреем сам пакет, который использует gomobile bind
+          go get golang.org/x/mobile/bind@latest || true
           "${HOME}/go/bin/gomobile" version || true
 
-      - name: Install dos2unix (for optional patch script)
+      - name: Install dos2unix (optional)
         shell: bash
         run: |
           set -euxo pipefail
@@ -94,7 +96,6 @@ jobs:
           REF="${{ github.event.inputs.core_ref }}"
           : "${REPO_URL:=https://github.com/2dust/AndroidLibXrayLite.git}"
           : "${REF:=}"
-
           echo "[clone] ${REPO_URL} ${REF:+@ $REF}"
           if [[ -z "$REF" ]]; then
             git clone --depth=1 "${REPO_URL}" AndroidLibXrayLite
@@ -111,7 +112,7 @@ jobs:
             dos2unix scripts/disable_xudp.sh || true
             bash scripts/disable_xudp.sh AndroidLibXrayLite
           else
-            echo "No disable_xudp.sh — skip patch"
+            echo "No disable_xudp.sh — skip"
           fi
 
       - name: gomobile init
@@ -132,20 +133,32 @@ jobs:
           echo "==== go env ===="
           go env
 
-          MOBILE_DIR="$(grep -RIl --include='*.go' -m1 '^package[[:space:]]\+mobile$' AndroidLibXrayLite | xargs -r dirname || true)"
-          if [[ -z "${MOBILE_DIR}" ]]; then
-            if [[ -f AndroidLibXrayLite/go.mod ]]; then
-              MOBILE_DIR="AndroidLibXrayLite"
-            else
-              echo "::error::Не найден пакет 'mobile' и нет go.mod в корне AndroidLibXrayLite"; exit 1
+          # 1) Выбираем корректный пакет для bind
+          MOBILE_DIR=""
+          if [[ -d AndroidLibXrayLite/mobile ]]; then
+            MOBILE_DIR="AndroidLibXrayLite/mobile"
+          else
+            # фоллбек: поиск файлов с `package mobile`
+            found="$(grep -RIl --include='*.go' '^package[[:space:]]\+mobile$' AndroidLibXrayLite || true)"
+            if [[ -n "$found" ]]; then
+              MOBILE_DIR="$(dirname "$(echo "$found" | head -n1)")"
             fi
           fi
+
+          if [[ -z "${MOBILE_DIR}" ]]; then
+            echo "::error::Не найден пакет 'mobile' в AndroidLibXrayLite (ни папки mobile/, ни package mobile)."
+            exit 1
+          fi
+
           echo "Using package: ${MOBILE_DIR}"
 
+          # 2) Подтягиваем зависимости и прогреваем bind-пакет
           pushd "${MOBILE_DIR}"
-            go mod download
+            go mod download || true
           popd
+          go get golang.org/x/mobile/bind@latest || true
 
+          # 3) Сборка AAR
           "${HOME}/go/bin/gomobile" bind -v \
             -target=android/arm64 \
             -androidapi=24 \
